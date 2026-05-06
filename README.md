@@ -402,8 +402,6 @@ The notebook is designed to be run top‑to‑bottom in Google Colab with a GPU 
 
 ---
 
-## 18. CONCLUSION
-
 The **Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System** demonstrates a complete deep learning pipeline:
 
 - Automatic dataset acquisition and cleaning
@@ -414,3 +412,378 @@ The **Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System** demons
 - Ready‑to‑deploy model and metadata
 
 This work fulfills the requirements of a deep learning course project and provides a foundation for further research in medical decision support.
+
+
+# Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System
+
+
+
+---
+
+## 1. PROJECT OVERVIEW
+
+| Property                  | Details                                                                                                                                                                                |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Project type**          | Deep Learning course project + Streamlit Cloud deployment prototype                                                                                                                    |
+| **Main objective**        | Detect X‑ray fracture/crack suspicion, display suspicious visual evidence with Grad‑CAM, and generate an interpretable risk report fusing image evidence and patient clinical factors. |
+| **Architecture**          | Multi‑modal CNN: a pretrained CNN image branch (no Vision Transformers) concatenated with a dense patient‑feature branch. Output is a fracture probability.                            |
+| **Framework**             | TensorFlow / Keras (training, saving, inference)                                                                                                                                       |
+| **Dataset**               | FracAtlas (downloaded automatically via `kagglehub`; no dataset files embedded in the repository).                                                                                     |
+| **Final model**           | `fracture_model.keras`                                                                                                                                                                 |
+| **In‑notebook GUI**       | Gradio (for Colab demonstration)                                                                                                                                                       |
+| **Production deployment** | Streamlit Cloud app (inference only)                                                                                                                                                   |
+| **Clinical safety**       | This is an academic decision‑support prototype. It is **not** a medical device and must not replace radiologist or physician review.                                                   |
+
+**Reference:**  
+Abedeen *et al.*, *FracAtlas: A Dataset for Fracture Classification, Localization and Segmentation of Musculoskeletal Radiographs*. Scientific Data, 2023.  
+DOI: [10.1038/s41597‑023‑02432‑4](https://doi.org/10.1038/s41597-023-02432-4)
+
+---
+
+## 2. RUNTIME SETUP & DEPENDENCIES
+
+The notebook is designed for **Google Colab with GPU**. All required packages are installed within the notebook.
+
+```python
+%pip install -q kagglehub opencv-python-headless seaborn tqdm scikit-learn pycocotools gradio
+```
+
+Core libraries: `tensorflow`, `pandas`, `numpy`, `matplotlib`, `seaborn`, `opencv`, `scikit‑learn`, `pycocotools`, `gradio`.
+
+Reproducibility: fixed random seed (`SEED = 42`) across Python, NumPy, and TensorFlow. GPU memory growth is enabled.
+
+---
+
+## 3. PROJECT CONFIGURATION
+
+Key constants controlling runtime cost and model strength:
+
+| Parameter                         | Value         | Description                                           |
+| --------------------------------- | ------------- | ----------------------------------------------------- |
+| `IMG_SIZE`                        | (224, 224)    | Input image resolution                                |
+| `BATCH_SIZE`                      | 32            | Training batch size                                   |
+| `CNN_BACKBONE_NAME`               | `DenseNet121` | Default final CNN backbone (can be changed)           |
+| `EPOCHS_HEAD`                     | 10            | Epochs when backbone is frozen                        |
+| `EPOCHS_FINE`                     | 8             | Epochs for fine‑tuning                                |
+| `FINE_TUNE_LAST_N_LAYERS`         | 30            | Number of last backbone layers unfrozen               |
+| `MAX_IMAGES_PER_CLASS`            | `None`        | Use all images (`None`); set e.g. 400 for a quick run |
+| `USE_BALANCED_TRAIN_OVERSAMPLING` | `True`        | Oversample minority class to match majority           |
+| `OVERSAMPLE_TARGET_MULTIPLIER`    | 1.0           | 1.0 = equal class sizes                               |
+| `USE_STRONG_AUGMENTATION`         | `True`        | Use more aggressive data augmentation                 |
+| `USE_TEST_TIME_AUGMENTATION`      | `True`        | Apply TTA during evaluation                           |
+| `TTA_STEPS`                       | 5             | Number of augmented variants for TTA                  |
+| `RUN_SIMPLE_CNN_BASELINE`         | `True`        | Train a small CNN from scratch for comparison         |
+| `RUN_BACKBONE_COMPARISON`         | `False`       | Optional fast comparison of multiple backbones        |
+
+---
+
+## 4. SUPPORTED CNN BACKBONES (MODEL ZOO)
+
+The project supports a large collection of **CNN‑only** backbones (no Vision Transformers). These are organised into tiers for convenience:
+
+| Tier                  | Examples                                                        | Recommended Use               |
+| --------------------- | --------------------------------------------------------------- | ----------------------------- |
+| **Light / Fast**      | MobileNetV2, MobileNetV3Small, EfficientNetB0                   | Quick experiments, deployment |
+| **Balanced / Strong** | DenseNet121, DenseNet169, EfficientNetB3, ResNet50, ResNet101   | Default academic training     |
+| **Powerful**          | DenseNet201, EfficientNetB5, EfficientNetV2S, InceptionResNetV2 | Stronger if GPU allows        |
+| **Extreme / Heavy**   | EfficientNetB7, EfficientNetV2M, EfficientNetV2L, ConvNeXtLarge | Memory‑intensive experiments  |
+
+All backbones are imported from `tf.keras.applications` with ImageNet weights. Their preprocessing (rescaling, normalisation) is automatically applied according to the original architecture’s requirements.
+
+---
+
+## 5. DATA ACQUISITION & PREPROCESSING
+
+### 5.1 FracAtlas Download
+
+The dataset is obtained automatically via `kagglehub`:
+
+```python
+dataset_path = kagglehub.dataset_download('mahmudulhasantasin/fracatlas-original-dataset')
+```
+
+- **Files discovered:** 12,258
+- **Approximate size:** 327 MB
+- No manual uploads; the dataset remains in the Colab runtime, not in the repository.
+
+### 5.2 Binary Label Construction
+
+Labels are derived by parsing folder names and, if needed, CSV metadata. The final classes are:
+
+| Class           | Count     | Description                   |
+| --------------- | --------- | ----------------------------- |
+| 0               | 3,307     | Normal / Non‑fractured        |
+| 1               | 717       | Fracture / Crack              |
+| **Total valid** | **4,024** | (59 corrupted images removed) |
+
+Images pass a strict validity check with PIL and TensorFlow decoders.
+
+### 5.3 Synthetic Patient Tabular Data
+
+**Important disclosure:** FracAtlas contains no patient history. Therefore, **synthetic patient data** is generated for academic multi‑modal demonstration. These fields are never real EHR data.
+
+**17 tabular features** are engineered:
+
+| Feature                                                                                                    | Type    | Description                           |
+| ---------------------------------------------------------------------------------------------------------- | ------- | ------------------------------------- |
+| `age_norm`                                                                                                 | float   | Age / 110                             |
+| `gender_male`                                                                                              | binary  | 1 = Male, 0 = Female                  |
+| `diabetes`, `osteoporosis`, `smoking`, `previous_fracture`                                                 | binary  | Risk factors                          |
+| `pain_norm`                                                                                                | float   | Pain level (1‑10) / 10                |
+| `injury_arm`, `injury_leg`, `injury_spine`, `injury_rib`, `injury_hip`                                     | one‑hot | Injury location                       |
+| `treatment_cast`, `treatment_surgery`, `treatment_physiotherapy`, `treatment_medication`, `treatment_none` | one‑hot | Treatment history (derived from text) |
+
+Synthetic records are generated using a random number generator with clinically plausible correlations: older age and fracture label increase the likelihood of osteoporosis, pain, and previous fracture; positive label increases the chance of previous fracture and a heavier treatment history.
+
+Patient name is stored but **never used as a model feature** – it appears only in generated reports.
+
+### 5.4 Train / Validation / Test Split & Oversampling
+
+The dataset is split **stratified** (70% train, 15% validation, 15% test). Before splitting, training data can be **oversampled** to balance classes (using `OVERSAMPLE_TARGET_MULTIPLIER = 1.0`). This results in equal numbers of Normal and Fracture images in the training set, while validation and test sets preserve the original distribution.
+
+Class weights are computed from the original training fold to further counter imbalance:
+
+- Class 0 (Normal): ~0.61
+- Class 1 (Fracture): ~2.80
+
+---
+
+## 6. DATA PIPELINE & AUGMENTATION
+
+A `tf.data` pipeline decodes images (224×224×3), pairs them with the 17‑dimensional patient vector, and applies augmentation (only during training).
+
+**Standard augmentation:**
+
+- Random horizontal flip
+- Random rotation (±0.04 rad)
+- Random zoom (0.08)
+- Random contrast (0.10)
+
+**Strong augmentation** (when enabled):
+
+- Random rotation (±0.06), translation (±5%), zoom (0.12), contrast (0.16)
+- Gaussian noise (σ=2.0)
+
+**Test‑time augmentation (TTA)**: at inference, 5 variants (original, horizontal flip, contrast/brightness adjustments) are averaged to produce the final probability.
+
+---
+
+## 7. MODEL ARCHITECTURE
+
+### 7.1 Simple CNN Baseline (Image‑Only, from Scratch)
+
+A small CNN (4 conv blocks, global average pooling, dense layers) trained from scratch on a balanced subset (500 images/class, 3 epochs). This serves as an academic lower bound to demonstrate the benefit of transfer learning and multi‑modal fusion.
+
+### 7.2 Multi‑Modal CNN
+
+The final model fuses a pretrained image branch and a dense tabular branch.
+
+**Image branch:**
+
+- Pretrained CNN (e.g., DenseNet121, ImageNet weights)
+- Preprocessing (rescaling + normalisation per architecture)
+- Frozen during Phase 1
+- Output: `last_conv_features` (feature map for Grad‑CAM) → GlobalAveragePooling2D → Dropout → Dense(128) → image embedding
+
+**Patient feature branch:**
+
+- BatchNormalisation → Dense(64, relu) → Dropout → Dense(32, relu) → patient embedding
+
+**Fusion & decision:**
+
+- Concatenate(image_embedding, patient_embedding)
+- Dense(128, relu) with L2 regularisation → Dropout(0.35)
+- Dense(64, relu)
+- Dense(1, sigmoid) → fracture probability
+
+**Total parameters:** ~7.2 M (163 k trainable in Phase 1). The architecture is identical for any supported CNN backbone; the `last_conv_features` layer name is consistent, enabling Grad‑CAM for all.
+
+---
+
+## 8. TRAINING STRATEGY
+
+### 8.1 Phase 1 – Frozen Backbone
+
+- Backbone frozen, only head + patient branch trained
+- Optimizer: Adam (lr = 1e‑3)
+- Loss: binary crossentropy with class weights
+- Callbacks: `ModelCheckpoint` (best `val_auc`), `EarlyStopping` (patience=4, restore best), `ReduceLROnPlateau` (factor=0.3, patience=2)
+
+### 8.2 Phase 2 – Fine‑Tuning (optional)
+
+- Last 30 layers of backbone unfrozen
+- Learning rate reduced to 1e‑5
+- Training continues from the best checkpoint of Phase 1
+
+### 8.3 Optional Backbone Comparison
+
+If `RUN_BACKBONE_COMPARISON = True`, a small subset (250 images/class) is used to train each backbone for 2 epochs. Validation AUC and accuracy are compared, and the best backbone can be automatically selected for the final full training.
+
+---
+
+## 9. EVALUATION & METRICS
+
+### 9.1 Threshold Selection
+
+The decision threshold is optimised on the validation set by maximising the F1 score.
+
+### 9.2 Test Set Performance (with TTA, if enabled)
+
+| Metric               | Value |
+| -------------------- | ----- |
+| Accuracy             | 0.917 |
+| Precision (Fracture) | 0.835 |
+| Recall (Fracture)    | 0.664 |
+| F1‑score (Fracture)  | 0.740 |
+| ROC‑AUC              | 0.948 |
+| Average Precision    | 0.871 |
+
+**Confusion Matrix (test, threshold = 0.667):**
+
+|                   | Predicted Normal | Predicted Fracture |
+| ----------------- | ---------------- | ------------------ |
+| **True Normal**   | 483              | 14                 |
+| **True Fracture** | 36               | 71                 |
+
+The model achieves high overall accuracy but a moderate false‑negative rate (36 missed fractures out of 107). This is clinically important and highlights why the system must be used only as decision support.
+
+**Learning curves** for loss, AUC, accuracy, precision, and recall over both training phases are plotted to monitor overfitting.
+
+### 9.3 Error Analysis
+
+The most confident mistakes (both false positives and false negatives) are listed. Confident false negatives deserve special attention as they represent fractures the model strongly classifies as normal.
+
+---
+
+## 10. EXPLAINABILITY: GRAD‑CAM
+
+Grad‑CAM heatmaps are generated using the `last_conv_features` activation layer. The technique highlights image regions that most influence the fracture probability. This is **explanatory evidence**, not a diagnostic segmentation.
+
+For several test images, side‑by‑side displays show the original X‑ray and the Grad‑CAM overlay. Heatmaps should roughly align with clinically plausible suspicious regions when predictions are correct.
+
+---
+
+## 11. RISK STRATIFICATION & AUTOMATED REPORT
+
+A **transparent rule‑based scoring system** combines CNN probability with patient factors to produce an interpretable risk level.
+
+**Clinical risk points** (max 7):
+
+- Age ≥ 65: +1
+- Diabetes: +1
+- Osteoporosis: +1
+- Smoking: +1
+- Previous fracture: +1
+- Pain level ≥ 8: +1
+- Injury location Hip or Spine: +1
+
+**Risk score** = 100 × (0.65 × probability + 0.35 × (clinical_points / 7))
+
+**Risk levels:**
+
+| Level    | Criteria                                  |
+| -------- | ----------------------------------------- |
+| Critical | risk_score ≥ 80 **or** probability ≥ 0.90 |
+| High     | risk_score ≥ 60 **or** probability ≥ 0.70 |
+| Moderate | risk_score ≥ 35 **or** probability ≥ 0.45 |
+| Low      | otherwise                                 |
+
+An example generated report includes:
+
+- Patient demographics and history
+- Model finding (Fracture/Crack suspected or not)
+- Probability, threshold, risk level, risk score
+- Grad‑CAM reminder
+- Clinical safety disclaimer
+
+This separation makes the system auditable: the neural model outputs probability; clinical factors adjust the risk level without modifying the model.
+
+---
+
+## 12. INFERENCE & DEPLOYMENT
+
+### 12.1 In‑Notebook Gradio GUI
+
+A polished Gradio interface runs inside Colab after training:
+
+- Upload an X‑ray image
+- Enter patient details (age, gender, injury location, pain level, medical history)
+- Display fracture/crack probability and clinical risk level
+- Show Grad‑CAM overlay
+- Generate downloadable clinical support report
+
+This GUI is for academic demonstration; production deployment is separate.
+
+### 12.2 Streamlit Cloud App
+
+The notebook generates two files for cloud deployment:
+
+- `streamlit_app.py` – inference‑only Streamlit app (loads `fracture_model.keras` and `training_metadata.json`)
+- `requirements.txt` – pinned dependencies (`tensorflow-cpu==2.16.2` for smaller container size)
+
+**Deployment checklist:**
+
+- Push `streamlit_app.py`, `requirements.txt`, `fracture_model.keras`, and `training_metadata.json` to the repository.
+- The app loads the model once (cached), accepts an X‑ray upload and patient form, runs TTA inference, displays probability, risk level, Grad‑CAM, and report.
+- No training code is present in the deployed app; only inference.
+
+---
+
+## 13. REPRODUCIBILITY & ARTIFACTS
+
+After training, the notebook saves:
+
+- **`fracture_model.keras`** – the best multi‑modal model (∼30 MB)
+- **`training_metadata.json`** – includes backbone, threshold, feature names, test metrics, data disclosure, and clinical disclaimer
+
+These files make the Streamlit app deterministic and auditable. The FracAtlas dataset is never embedded; it is downloaded only during Colab training.
+
+---
+
+## 14. ACADEMIC SELF‑EVALUATION & DISCUSSION POINTS
+
+**Target quality:** 9–9.5 / 10 for a Deep Learning course submission.
+
+**Strengths:**
+
+- Multi‑modal CNN (image + structured data), no Vision Transformer
+- Large CNN model zoo with tiered presets
+- Simple image‑only baseline for comparison
+- Oversampling and class weights to handle imbalance
+- TTA, strong augmentation, fine‑tuning
+- Grad‑CAM explainability
+- Transparent risk scoring
+- Automatic dataset download → no dataset hosted in repository
+- Clean separation: training in notebook, inference in Streamlit
+- Clinical safety notes and synthetic data disclosure
+
+**Suggested academic discussion points:**
+
+- Which backbone performed best, and why DenseNet is a strong default for X‑rays.
+- Impact of synthetic patient data – demonstrates fusion but does not validate real clinical risk.
+- Class imbalance: recall on the fracture class remains moderate; false negatives are clinically risky.
+- Grad‑CAM provides model evidence but not ground‑truth segmentation.
+- Deployment boundary: training only in Colab; cloud app performs inference only.
+
+**Potential improvements:**
+
+- Real clinical data for patient factors
+- Explore dedicated loss functions for class imbalance (e.g., focal loss)
+- Ensemble of multiple backbones
+- Prospective validation on external hospital data
+
+---
+
+## 15. CONCLUSION
+
+The **Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System** is a comprehensive deep learning project that covers:
+
+- Robust data handling with automatic download and cleaning
+- Bi‑modal CNN architecture with a large backbone zoo
+- Thorough training with oversampling, augmentation, and fine‑tuning
+- Detailed evaluation including threshold optimisation, ROC, PR, and error analysis
+- Explainability via Grad‑CAM
+- A transparent clinical risk scoring system
+- Deployment as a Streamlit Cloud app
+
+The project fulfills all design guarantees and provides a solid foundation for further research in medical decision‑support AI.
