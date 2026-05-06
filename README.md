@@ -414,7 +414,3 @@ The **Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System** demons
 - Ready‑to‑deploy model and metadata
 
 This work fulfills the requirements of a deep learning course project and provides a foundation for further research in medical decision support.
-
----
-
-*End of Document – Automated Multi‑Modal X‑Ray Fracture & Crack Reporting System*
